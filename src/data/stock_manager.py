@@ -12,6 +12,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import functools
 import threading
 from collections import defaultdict
+import aiohttp
+import asyncio
 import requests
 
 class StockDataCache:
@@ -86,19 +88,17 @@ class StockManager:
         try:
             # 获取实时行情
             df = ak.stock_zh_a_spot_em()
-            stock_data = df[df['代码'] == stock_code].iloc[0]
+            stock_data = df[df['代码'] == stock_code]
             
-            return (
-                stock_code,
-                stock_data['名称'],
-                float(stock_data['最新价']),
-                float(stock_data['涨跌幅']),
-                int(stock_data['成交量']),
-                float(stock_data['成交额'])
-            )
+            if stock_data.empty:
+                return False, f"未找到股票{stock_code}的信息"
+                
+            stock_data = stock_data.iloc[0]
+            return True, stock_data['名称']
+            
         except Exception as e:
             print(f"获取股票{stock_code}信息失败：{str(e)}")
-            return None
+            return False, str(e)
 
     @staticmethod
     def get_stock_data(stock_code: str) -> dict:
@@ -213,153 +213,244 @@ class StockManager:
             return False, f"删除失败：{str(e)}"
     
     @classmethod
-    def _batch_get_real_time_data(cls, codes):
-        """批量获取实时数据"""
-        start_time = time.time()
+    async def _async_get_stocks_from_db(cls):
+        """从数据库获取所有股票信息"""
+        session = cls.Session()
         try:
-            # 使用 akshare 一次性获取所有股票的实时行情
-            df = ak.stock_zh_a_spot_em()
-            api_time = time.time() - start_time
-            print(f"[性能] 实时行情API调用耗时: {api_time:.2f}秒")
+            query = cls.stocks_table.select()
+            stocks = session.execute(query).fetchall()
             
-            result = {}
-            process_start = time.time()
+            # 将 Row 对象转换为字典列表
+            stock_dicts = []
+            for stock in stocks:
+                stock_dict = {
+                    'code': stock.code,
+                    'name': stock.name,
+                    'notes': stock.notes,
+                    'register_date': stock.register_date,
+                    'entry_price': stock.entry_price,
+                    'actual_cost': stock.actual_cost,
+                    'quantity': stock.quantity,
+                    'total_cost': stock.total_cost
+                }
+                stock_dicts.append(stock_dict)
+            return stock_dicts
+        finally:
+            session.close()
+
+    @classmethod
+    async def _async_get_real_time_data(cls, codes):
+        """一次性获取所有股票的实时数据"""
+        try:
+            # 使用akshare获取实时数据
+            df = await asyncio.get_event_loop().run_in_executor(
+                None, ak.stock_zh_a_spot_em
+            )
+            
             # 将数据转换为字典格式，加快查找速度
             data_dict = {row['代码']: row for _, row in df.iterrows()}
             
+            result = {}
             for code in codes:
                 if code in data_dict:
                     stock_data = data_dict[code]
-                    current_price = float(stock_data['最新价'])
-                    cls._cache.set_cached_data(code, {
-                        "current_price": str(current_price),
-                        "daily_change": f"{float(stock_data['涨跌幅']):.2f}%"
-                    })
-                    result[code] = cls._cache.get_cached_data(code)
+                    result[code] = {
+                        "current_price": float(stock_data['最新价']),
+                        "daily_change": f"{float(stock_data['涨跌幅']):.2f}%",
+                        "daily_amount": float(stock_data['成交额']) / 100000000,  # 转换为亿元
+                        "turnover_rate": float(stock_data['换手率'])
+                    }
             
-            process_time = time.time() - process_start
-            print(f"[性能] 实时数据处理耗时: {process_time:.2f}秒")
             return result
         except Exception as e:
-            print(f"批量获取实时数据失败：{str(e)}")
+            print(f"获取实时数据失败：{str(e)}")
             return {}
 
     @classmethod
-    def _process_stock_batch(cls, stock_batch):
-        """处理一批股票数据"""
-        # 批量获取实时数据
-        codes = [stock['code'] for stock in stock_batch]
-        real_time_data = cls._batch_get_real_time_data(codes)
-        
-        # 使用线程池处理每个股票的出手机会和止损点
-        with ThreadPoolExecutor(max_workers=len(stock_batch)) as executor:
-            futures = []
-            for stock in stock_batch:
-                future = executor.submit(cls._process_single_stock, stock, real_time_data.get(stock['code']))
-                futures.append(future)
+    async def _async_process_single_stock(cls, stock, real_time_data):
+        """异步处理单个股票数据"""
+        try:
+            # 更新实时数据
+            if real_time_data:
+                stock.update(real_time_data)
             
-            # 收集结果
-            results = []
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    print(f"处理股票数据时出错：{str(e)}")
+            # 计算各个目标价位
+            target_rates = {
+                '3%': stock['actual_cost'] * 1.03,
+                '5%': stock['actual_cost'] * 1.05,
+                '8%': stock['actual_cost'] * 1.08,
+                '10%': stock['actual_cost'] * 1.10
+            }
+            stop_loss_price = stock['actual_cost'] * 0.95
+            
+            # 获取日线数据
+            daily_data = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: ak.stock_zh_a_hist(
+                    symbol=stock['code'],
+                    period="daily",
+                    start_date=(stock['register_date'] + timedelta(days=1)).strftime('%Y%m%d'),
+                    end_date=(datetime.now()).strftime('%Y%m%d'),
+                    adjust="qfq"
+                )
+            )
+            
+            # 初始化机会记录
+            first_opportunities = {
+                '3%': None,
+                '5%': None,
+                '8%': None,
+                '10%': None
+            }
+            first_stop_loss = None
+            
+            if daily_data is not None and not daily_data.empty:
+                # 分析每个交易日的情况
+                trading_day_count = 0
+                
+                for _, row in daily_data.iterrows():
+                    if trading_day_count >= 3:  # 只看前3个交易日
+                        break
+                    
+                    current_date = row['日期']
+                    actual_high = float(row['最高'])
+                    actual_low = float(row['最低'])
+                    
+                    # 检查每个目标收益率
+                    for rate in ['3%', '5%', '8%', '10%']:
+                        if first_opportunities[rate] is None and actual_high >= target_rates[rate]:
+                            first_opportunities[rate] = current_date
+                    
+                    # 检查是否触发止损
+                    if first_stop_loss is None and actual_low <= stop_loss_price:
+                        first_stop_loss = current_date
+                    
+                    trading_day_count += 1
+            
+            # 添加分析结果到股票数据中
+            stock['trading_analysis'] = {
+                'first_opportunities': first_opportunities,
+                'first_stop_loss': first_stop_loss,
+                'target_prices': target_rates,
+                'stop_loss_price': stop_loss_price
+            }
+            
+            return stock
+            
+        except Exception as e:
+            print(f"处理股票 {stock['code']} 数据时出错：{str(e)}")
+            # 确保即使出错也返回基本的分析结果
+            stock['trading_analysis'] = {
+                'first_opportunities': {rate: None for rate in ['3%', '5%', '8%', '10%']},
+                'first_stop_loss': None,
+                'target_prices': {
+                    '3%': stock['actual_cost'] * 1.03,
+                    '5%': stock['actual_cost'] * 1.05,
+                    '8%': stock['actual_cost'] * 1.08,
+                    '10%': stock['actual_cost'] * 1.10
+                },
+                'stop_loss_price': stock['actual_cost'] * 0.95
+            }
+            return stock
+
+    @classmethod
+    async def process_stocks(cls):
+        """处理所有股票数据的主函数"""
+        try:
+            # 1. 从数据库获取所有股票信息
+            stocks = await cls._async_get_stocks_from_db()
+            if not stocks:
+                return []
+
+            # 2. 一次性获取所有股票的实时数据
+            real_time_data = await cls._async_get_real_time_data([s['code'] for s in stocks])
+
+            # 3. 并行处理每只股票的分析
+            tasks = []
+            for stock in stocks:
+                stock_real_time = real_time_data.get(stock['code'], {})
+                tasks.append(cls._async_process_single_stock(stock, stock_real_time))
+
+            # 4. 等待所有分析完成
+            results = await asyncio.gather(*tasks)
+            
+            # 5. 确保每个结果都包含完整的分析信息
+            for result in results:
+                if 'trading_analysis' not in result:
+                    result['trading_analysis'] = {
+                        'target_prices': {
+                            '3%': result['actual_cost'] * 1.03,
+                            '5%': result['actual_cost'] * 1.05,
+                            '8%': result['actual_cost'] * 1.08,
+                            '10%': result['actual_cost'] * 1.10
+                        },
+                        'stop_loss_price': result['actual_cost'] * 0.95,
+                        'first_opportunities': {
+                            '3%': None,
+                            '5%': None,
+                            '8%': None,
+                            '10%': None
+                        },
+                        'first_stop_loss': None
+                    }
             
             return results
 
-    @classmethod
-    def _process_single_stock(cls, stock_dict, real_time_data):
-        """处理单个股票数据"""
-        start_time = time.time()
-        try:
-            if real_time_data:
-                stock_dict.update(real_time_data)
-            
-            # 使用缓存获取分时数据
-            cache_start = time.time()
-            cached_min_data = cls._cache.get_cached_data(stock_dict['code'], 'min_data')
-            cache_time = time.time() - cache_start
-            
-            if cached_min_data:
-                opportunities = cached_min_data.get('opportunities')
-                stop_loss = cached_min_data.get('stop_loss')
-                print(f"[性能] 股票{stock_dict['code']}使用缓存数据，耗时: {cache_time:.2f}秒")
-            else:
-                calc_start = time.time()
-                # 计算出手机会和止损点
-                opportunities = cls.check_selling_opportunities(
-                    stock_dict['code'],
-                    stock_dict['register_date'],
-                    stock_dict['actual_cost'],
-                    stock_dict['quantity']
-                )
-                stop_loss = cls.check_stop_loss_point(
-                    stock_dict['code'],
-                    stock_dict['register_date'],
-                    stock_dict['actual_cost'],
-                    stock_dict['quantity']
-                )
-                calc_time = time.time() - calc_start
-                print(f"[性能] 股票{stock_dict['code']}计算数据耗时: {calc_time:.2f}秒")
-                
-                # 缓存计算结果
-                cls._cache.set_cached_data(stock_dict['code'], {
-                    'opportunities': opportunities,
-                    'stop_loss': stop_loss
-                }, 'min_data')
-            
-            stock_dict['selling_opportunities'] = opportunities
-            stock_dict['stop_loss_point'] = stop_loss
-            
-            total_time = time.time() - start_time
-            print(f"[性能] 股票{stock_dict['code']}总处理耗时: {total_time:.2f}秒")
-            return stock_dict
         except Exception as e:
-            print(f"处理股票 {stock_dict['code']} 数据时出错：{str(e)}")
-            return stock_dict
+            print(f"处理股票数据时出错：{str(e)}")
+            return []
 
     @classmethod
     def list_all_stocks(cls):
+        """同步包装异步处理函数"""
         try:
-            session = cls.Session()
-            try:
-                # 使用 select 语句获取所有字段
-                query = cls.stocks_table.select()
-                stocks = session.execute(query).fetchall()
+            results = asyncio.run(cls.process_stocks())
+            if not results:
+                print("没有找到任何股票")
+                return []
+
+            print("\n股票分析结果：")
+            print("=" * 100)
+            
+            for stock in results:
+                print(f"\n{stock['code']} {stock['name']}")
+                print("-" * 50)
                 
-                # 将 Row 对象转换为字典列表
-                stock_dicts = []
-                for stock in stocks:
-                    stock_dict = {
-                        'code': stock.code,
-                        'name': stock.name,
-                        'notes': stock.notes,
-                        'register_date': stock.register_date,
-                        'entry_price': stock.entry_price,
-                        'actual_cost': stock.actual_cost,
-                        'quantity': stock.quantity,
-                        'total_cost': stock.total_cost
-                    }
-                    stock_dicts.append(stock_dict)
+                # 计算已入手天数
+                days_held = (datetime.now() - stock['register_date']).days
                 
-                # 将股票列表分成批次处理
-                batches = [stock_dicts[i:i + cls.BATCH_SIZE] 
-                          for i in range(0, len(stock_dicts), cls.BATCH_SIZE)]
+                # 打印基本信息
+                print(f"现价：{stock.get('current_price', '获取失败')} "
+                      f"成本：{stock['actual_cost']:.2f} "
+                      f"数量：{stock['quantity']} "
+                      f"总成本：{stock['total_cost']:.2f} "
+                      f"入手时间：{stock['register_date'].strftime('%Y-%m-%d')} "
+                      f"已入手：{days_held}天")
                 
-                # 使用进程池处理批次数据
-                with Pool(processes=min(cpu_count(), len(batches))) as pool:
-                    results = pool.map(cls._process_stock_batch, batches)
-                
-                # 合并所有结果
-                final_results = []
-                for batch_result in results:
-                    final_results.extend(batch_result)
-                
-                return final_results
-            finally:
-                session.close()
+                # 打印分析结果
+                if 'trading_analysis' in stock:
+                    analysis = stock['trading_analysis']
+                    if 'target_prices' in analysis and 'first_opportunities' in analysis:
+                        target_prices = analysis['target_prices']
+                        opportunities = analysis['first_opportunities']
+                        
+                        print("\n目标价位分析：")
+                        for rate in ['3%', '5%', '8%', '10%']:
+                            target_price = target_prices[rate]
+                            first_date = opportunities[rate]
+                            status = f"有机会（{first_date}）" if first_date else "暂无机会"
+                            print(f"  {rate}目标价（{target_price:.2f}）：{status}")
+                        
+                        # 打印止损情况
+                        stop_loss = analysis.get('first_stop_loss')
+                        stop_loss_price = analysis.get('stop_loss_price')
+                        if stop_loss_price:
+                            stop_loss_status = f"触发止损（{stop_loss}）" if stop_loss else "未触发止损"
+                            print(f"\n止损价（{stop_loss_price:.2f}）：{stop_loss_status}")
+            
+            print("\n" + "=" * 100)
+            return results
+            
         except Exception as e:
             print(f"获取股票列表失败：{str(e)}")
             return []
@@ -395,151 +486,6 @@ class StockManager:
                 session.close()
         except Exception as e:
             return False, f"更新失败：{str(e)}"
-
-    @classmethod
-    def check_selling_opportunities(cls, stock_code, register_date, actual_cost, quantity):
-        """检查股票在入手后3个交易日内的出手机会（T+1交易模式）"""
-        # 初始化结果字典
-        opportunities = {
-            '3%': {'first_opportunity': None, 'daily_counts': [0, 0, 0]},
-            '5%': {'first_opportunity': None, 'daily_counts': [0, 0, 0]},
-            '8%': {'first_opportunity': None, 'daily_counts': [0, 0, 0]},
-            '10%': {'first_opportunity': None, 'daily_counts': [0, 0, 0]}
-        }
-
-        # 设置起始日期为注册日期的下一个交易日（T+1）
-        current_date = register_date + timedelta(days=1)
-        end_datetime = register_date + timedelta(days=5)  # 考虑节假日，多给两天
-        trading_days = 0
-
-        while current_date <= end_datetime and trading_days < 3:
-            try:
-                # 获取分时数据
-                date_str = current_date.strftime('%Y%m%d')
-                min_data = ak.stock_zh_a_hist_min_em(symbol=stock_code, 
-                                                    start_date=date_str, 
-                                                    end_date=date_str)
-                
-                if not min_data.empty:  # 如果有数据，说明是交易日
-                    # 检查每个分时点
-                    for _, row in min_data.iterrows():
-                        high_price = float(row['最高'])
-                        # 考虑卖出费用（假设为0.4%）
-                        actual_high = high_price * 0.996
-                        
-                        # 计算实际收益率
-                        return_rate = (actual_high / actual_cost - 1)
-                        
-                        # 检查不同收益率目标
-                        if return_rate >= 0.03:  # 3%
-                            opportunities['3%']['daily_counts'][trading_days] += 1
-                            if opportunities['3%']['first_opportunity'] is None:
-                                opportunities['3%']['first_opportunity'] = {
-                                    'time': row['时间'],
-                                    'price': high_price,
-                                    'return_rate': return_rate
-                                }
-                        
-                        if return_rate >= 0.05:  # 5%
-                            opportunities['5%']['daily_counts'][trading_days] += 1
-                            if opportunities['5%']['first_opportunity'] is None:
-                                opportunities['5%']['first_opportunity'] = {
-                                    'time': row['时间'],
-                                    'price': high_price,
-                                    'return_rate': return_rate
-                                }
-                        
-                        if return_rate >= 0.08:  # 8%
-                            opportunities['8%']['daily_counts'][trading_days] += 1
-                            if opportunities['8%']['first_opportunity'] is None:
-                                opportunities['8%']['first_opportunity'] = {
-                                    'time': row['时间'],
-                                    'price': high_price,
-                                    'return_rate': return_rate
-                                }
-                        
-                        if return_rate >= 0.10:  # 10%
-                            opportunities['10%']['daily_counts'][trading_days] += 1
-                            if opportunities['10%']['first_opportunity'] is None:
-                                opportunities['10%']['first_opportunity'] = {
-                                    'time': row['时间'],
-                                    'price': high_price,
-                                    'return_rate': return_rate
-                                }
-                    
-                    trading_days += 1
-                
-            except Exception as e:
-                print(f"获取股票{stock_code}在{date_str}的分时数据时出错：{str(e)}")
-            
-            current_date += timedelta(days=1)
-        
-        return opportunities
-
-    @classmethod
-    def check_stop_loss_point(cls, stock_code, register_date, actual_cost, quantity):
-        """检查股票在入手后3个交易日内的止损点（T+1交易模式）"""
-        try:
-            # 获取入手日期后的5个自然日数据（为了确保能获取到3个交易日）
-            end_date = (register_date + timedelta(days=5)).strftime('%Y%m%d')
-            start_date = (register_date + timedelta(days=1)).strftime('%Y%m%d')  # T+1：从下一天开始
-            
-            stop_loss_price = actual_cost * 0.95  # 止损价格（实际成本的95%）
-            total_cost = actual_cost * quantity  # 总实际成本
-            
-            trading_days = 0
-            current_date = datetime.strptime(start_date, '%Y%m%d')
-            end_datetime = datetime.strptime(end_date, '%Y%m%d')
-            
-            # 用于记录最佳止损点
-            best_stop_loss = {
-                'diff': float('inf'),
-                'data': None
-            }
-            
-            while current_date <= end_datetime and trading_days < 3:
-                date_str = current_date.strftime('%Y%m%d')
-                try:
-                    # 获取分时数据
-                    min_data = ak.stock_zh_a_hist_min_em(symbol=stock_code, 
-                                                        start_date=date_str, 
-                                                        end_date=date_str)
-                    
-                    if not min_data.empty:  # 如果有数据，说明是交易日
-                        trading_days += 1
-                        
-                        # 检查每个分时点
-                        for _, row in min_data.iterrows():
-                            low_price = float(row['最低'])
-                            actual_price = low_price * 0.996  # 考虑卖出费用
-                            
-                            if actual_price <= stop_loss_price:
-                                # 计算与止损价格的差距
-                                price_diff = abs(actual_price - stop_loss_price)
-                                
-                                # 如果这个价格比之前记录的更接近止损价格
-                                if price_diff < best_stop_loss['diff']:
-                                    best_stop_loss['diff'] = price_diff
-                                    actual_return_amount = actual_price * quantity  # 实际到手金额
-                                    loss_amount = actual_return_amount - total_cost  # 亏损金额
-                                    best_stop_loss['data'] = {
-                                        'date': current_date.strftime('%Y-%m-%d'),
-                                        'time': row['时间'],
-                                        'low_price': low_price,
-                                        'actual_price': actual_price,
-                                        'loss_rate': (actual_price / actual_cost - 1) * 100,
-                                        'return_amount': actual_return_amount,
-                                        'loss_amount': loss_amount
-                                    }
-                except Exception as e:
-                    pass
-                
-                current_date += timedelta(days=1)
-            
-            return best_stop_loss['data']
-            
-        except Exception as e:
-            return None
 
     @classmethod
     def test_minute_data_availability(cls, stock_code):
@@ -705,3 +651,35 @@ class StockManager:
                     print(f"处理股票{code}的结果时出错：{str(e)}")
         
         return opportunities 
+
+    @staticmethod
+    def print_performance_stats(timing_stats):
+        """打印性能统计"""
+        print("\n整体性能统计：")
+        print("-" * 50)
+        
+        # 打印获取股票列表时间
+        if '获取股票列表' in timing_stats:
+            elapsed = timing_stats['获取股票列表']
+            print("获取股票列表:")
+            print(f"  总耗时: {elapsed:.2f}秒")
+        print("-" * 50)
+        
+        # 打印获取实时数据时间
+        if '获取实时数据' in timing_stats:
+            elapsed = timing_stats['获取实时数据']
+            print("获取实时数据:")
+            print(f"  总耗时: {elapsed:.2f}秒")
+        print("-" * 50)
+        
+        # 打印每支股票的处理时间
+        print("\n每支股票的处理时间统计：")
+        print("-" * 50)
+        for code, stats in timing_stats.items():
+            if isinstance(stats, dict) and '股票名称' in stats:
+                print(f"\n股票 {code} ({stats['股票名称']}):")
+                print(f"  获取历史数据: {stats.get('获取历史数据', 0.00):.2f}秒")
+                print(f"  计算分析: {stats.get('计算分析', 0.00):.2f}秒")
+                total_time = (stats.get('获取历史数据', 0) + 
+                            stats.get('计算分析', 0))
+                print(f"  总处理时间: {total_time:.2f}秒") 

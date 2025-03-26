@@ -5,8 +5,6 @@ import time
 import akshare as ak
 import pandas as pd
 import numpy as np
-from sqlalchemy import create_engine, Table, Column, Integer, String, Float, DateTime, MetaData
-from sqlalchemy.orm import sessionmaker
 from multiprocessing import Pool, cpu_count
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import functools
@@ -15,6 +13,7 @@ from collections import defaultdict
 import aiohttp
 import asyncio
 import requests
+import mysql.connector
 
 class StockDataCache:
     """股票数据缓存类"""
@@ -55,32 +54,101 @@ class StockDataCache:
 
 class StockManager:
     # 数据库配置
-    DATABASE_URL = "mysql+pymysql://root:hepzibah1@localhost/stock_tracker?charset=utf8mb4"
-    engine = create_engine(DATABASE_URL)
-    Session = sessionmaker(bind=engine)
-    
+    DATABASE_CONFIG = {
+        'host': 'localhost',
+        'user': 'root',
+        'password': 'hepzibah1',
+        'database': 'stock_tracker'
+    }
+
+    # 更新时间间隔（分钟）
+    UPDATE_INTERVAL = 10
+
+    @staticmethod
+    def should_update_stock_info(last_update_time):
+        """检查是否需要更新股票信息
+        Args:
+            last_update_time: 上次更新时间
+        Returns:
+            bool: 是否需要更新
+        """
+        if not last_update_time:
+            return True
+        
+        current_time = datetime.now()
+        time_diff = current_time - last_update_time
+        return time_diff.total_seconds() >= StockManager.UPDATE_INTERVAL * 60
+
+    @staticmethod
+    def get_db_connection():
+        """获取数据库连接"""
+        return mysql.connector.connect(**StockManager.DATABASE_CONFIG)
+
+    @staticmethod
+    def init_database():
+        """初始化数据库表"""
+        conn = None
+        cursor = None
+        try:
+            conn = StockManager.get_db_connection()
+            cursor = conn.cursor()
+
+            # 创建股票表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS stocks (
+                    code VARCHAR(10) PRIMARY KEY,
+                    cost DECIMAL(10, 2) NOT NULL,
+                    quantity INT NOT NULL,
+                    total_cost DECIMAL(10, 2) NOT NULL,
+                    register_date DATETIME NOT NULL
+                )
+            """)
+
+            # 创建股票信息表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS stock_info (
+                    code VARCHAR(10) PRIMARY KEY,
+                    name VARCHAR(50) NOT NULL,
+                    current_price DECIMAL(10, 2) NOT NULL,
+                    update_time DATETIME NOT NULL,
+                    FOREIGN KEY (code) REFERENCES stocks(code)
+                )
+            """)
+
+            # 创建删除历史表
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS delete_history (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    code VARCHAR(10) NOT NULL,
+                    name VARCHAR(50) NOT NULL,
+                    price DECIMAL(10, 2) NOT NULL,
+                    cost DECIMAL(10, 2) NOT NULL,
+                    quantity INT NOT NULL,
+                    total_cost DECIMAL(10, 2) NOT NULL,
+                    delete_time DATETIME NOT NULL,
+                    INDEX idx_code (code),
+                    INDEX idx_delete_time (delete_time)
+                )
+            """)
+
+            conn.commit()
+            print("数据库表初始化成功")
+            
+        except Exception as e:
+            print(f"初始化数据库失败：{e}")
+            if conn:
+                conn.rollback()
+        finally:
+            if cursor:
+                cursor.close()
+            if conn:
+                conn.close()
+
     # 创建缓存实例
     _cache = StockDataCache()
     
     # 批量数据获取的大小
     BATCH_SIZE = 50
-    
-    # 创建元数据和表
-    metadata = MetaData()
-    stocks_table = Table(
-        'stocks', metadata,
-        Column('code', String(10), primary_key=True),
-        Column('name', String(50), nullable=False),
-        Column('notes', String(200)),
-        Column('register_date', DateTime, default=datetime.now),
-        Column('entry_price', Float, nullable=False),  # 入手价格
-        Column('actual_cost', Float, nullable=False),   # 实际成本
-        Column('quantity', Integer, nullable=False),    # 入手数量（股数）
-        Column('total_cost', Float, nullable=False)    # 总实际成本
-    )
-    
-    # 确保表存在
-    metadata.create_all(engine)
     
     @staticmethod
     def get_stock_info(stock_code: str) -> tuple:
@@ -142,10 +210,12 @@ class StockManager:
             if not success:
                 return False, name
             
-            session = cls.Session()
+            conn = cls.get_db_connection()
+            cursor = conn.cursor()
             try:
                 # 检查是否已存在
-                if session.query(cls.stocks_table).filter_by(code=code).first():
+                cursor.execute("SELECT * FROM stocks WHERE code = %s", (code,))
+                if cursor.fetchone():
                     return False, "股票已存在"
                 
                 # 计算实际成本（入手价格 * 100.04%）
@@ -154,21 +224,22 @@ class StockManager:
                 total_cost = actual_cost * quantity
                 
                 # 添加新股票
-                new_stock = {
-                    "code": code,
-                    "name": name,
-                    "notes": notes,
-                    "register_date": datetime.now(),
-                    "entry_price": entry_price,
-                    "actual_cost": actual_cost,
-                    "quantity": quantity,
-                    "total_cost": total_cost
-                }
-                session.execute(cls.stocks_table.insert().values(**new_stock))
-                session.commit()
+                cursor.execute("""
+                    INSERT INTO stocks (code, cost, quantity, total_cost, register_date)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (code, actual_cost, quantity, total_cost, datetime.now()))
+                conn.commit()
+
+                # 添加股票信息
+                cursor.execute("""
+                    INSERT INTO stock_info (code, name, current_price, update_time)
+                    VALUES (%s, %s, %s, %s)
+                """, (code, name, float(cls.get_stock_data(code)['current_price']), datetime.now()))
+                conn.commit()
+
                 return True, "添加成功"
             finally:
-                session.close()
+                cursor.close()
             
         except Exception as e:
             return False, f"添加失败：{str(e)}"
@@ -200,71 +271,119 @@ class StockManager:
     @classmethod
     def remove_stock(cls, code):
         try:
-            session = cls.Session()
+            conn = cls.get_db_connection()
+            cursor = conn.cursor()
             try:
-                result = session.execute(cls.stocks_table.delete().where(cls.stocks_table.c.code == code))
-                session.commit()
-                if result.rowcount > 0:
-                    return True, "删除成功"
-                return False, "股票不存在"
+                cursor.execute("DELETE FROM stocks WHERE code = %s", (code,))
+                cursor.execute("DELETE FROM stock_info WHERE code = %s", (code,))
+                conn.commit()
+                return True, "删除成功"
             finally:
-                session.close()
+                cursor.close()
         except Exception as e:
             return False, f"删除失败：{str(e)}"
     
     @classmethod
     async def _async_get_stocks_from_db(cls):
         """从数据库获取所有股票信息"""
-        session = cls.Session()
+        conn = cls.get_db_connection()
+        cursor = conn.cursor(dictionary=True)
         try:
-            query = cls.stocks_table.select()
-            stocks = session.execute(query).fetchall()
+            cursor.execute("SELECT * FROM stocks")
+            stocks = cursor.fetchall()
             
             # 将 Row 对象转换为字典列表
             stock_dicts = []
             for stock in stocks:
                 stock_dict = {
-                    'code': stock.code,
-                    'name': stock.name,
-                    'notes': stock.notes,
-                    'register_date': stock.register_date,
-                    'entry_price': stock.entry_price,
-                    'actual_cost': stock.actual_cost,
-                    'quantity': stock.quantity,
-                    'total_cost': stock.total_cost
+                    'code': stock['code'],
+                    'name': stock['name'],
+                    'notes': stock['notes'],
+                    'register_date': stock['register_date'],
+                    'entry_price': stock['cost'],
+                    'actual_cost': stock['cost'],
+                    'quantity': stock['quantity'],
+                    'total_cost': stock['total_cost']
                 }
                 stock_dicts.append(stock_dict)
             return stock_dicts
         finally:
-            session.close()
+            cursor.close()
+            conn.close()
 
     @classmethod
     async def _async_get_real_time_data(cls, codes):
         """一次性获取所有股票的实时数据"""
         try:
-            # 使用akshare获取实时数据
-            df = await asyncio.get_event_loop().run_in_executor(
-                None, ak.stock_zh_a_spot_em
-            )
+            conn = cls.get_db_connection()
+            cursor = conn.cursor(dictionary=True)
             
-            # 将数据转换为字典格式，加快查找速度
-            data_dict = {row['代码']: row for _, row in df.iterrows()}
-            
-            result = {}
-            for code in codes:
-                if code in data_dict:
-                    stock_data = data_dict[code]
-                    result[code] = {
-                        "current_price": float(stock_data['最新价']),
-                        "daily_change": f"{float(stock_data['涨跌幅']):.2f}%",
-                        "daily_amount": float(stock_data['成交额']) / 100000000,  # 转换为亿元
-                        "turnover_rate": float(stock_data['换手率'])
-                    }
-            
-            return result
+            try:
+                # 检查是否需要更新
+                cursor.execute("SELECT code, update_time FROM stock_info WHERE code IN (%s)" % ','.join(['%s'] * len(codes)), codes)
+                update_times = {row['code']: row['update_time'] for row in cursor.fetchall()}
+                
+                codes_to_update = [code for code in codes if code not in update_times or cls.should_update_stock_info(update_times[code])]
+                
+                if not codes_to_update:
+                    # 如果所有数据都是最新的，直接从数据库获取
+                    cursor.execute("""
+                        SELECT code, current_price, name
+                        FROM stock_info
+                        WHERE code IN (%s)
+                    """ % ','.join(['%s'] * len(codes)), codes)
+                    
+                    result = {}
+                    for row in cursor.fetchall():
+                        result[row['code']] = {
+                            "current_price": float(row['current_price']),
+                            "name": row['name']
+                        }
+                    return result
+                
+                # 使用akshare获取需要更新的股票数据
+                df = await asyncio.get_event_loop().run_in_executor(
+                    None, ak.stock_zh_a_spot_em
+                )
+                
+                # 将数据转换为字典格式，加快查找速度
+                data_dict = {row['代码']: row for _, row in df.iterrows()}
+                
+                # 更新数据库并返回结果
+                result = {}
+                for code in codes:
+                    if code in data_dict:
+                        stock_data = data_dict[code]
+                        current_price = float(stock_data['最新价'])
+                        name = stock_data['名称']
+                        
+                        # 更新数据库
+                        cursor.execute("""
+                            INSERT INTO stock_info (code, name, current_price, update_time)
+                            VALUES (%s, %s, %s, NOW())
+                            ON DUPLICATE KEY UPDATE
+                                name = VALUES(name),
+                                current_price = VALUES(current_price),
+                                update_time = NOW()
+                        """, (code, name, current_price))
+                        
+                        result[code] = {
+                            "current_price": current_price,
+                            "name": name
+                        }
+                
+                conn.commit()
+                return result
+                
+            finally:
+                cursor.close()
+                
         except Exception as e:
             print(f"获取实时数据失败：{str(e)}")
             return {}
+        finally:
+            if conn:
+                conn.close()
 
     @classmethod
     async def _async_process_single_stock(cls, stock, real_time_data):
@@ -400,60 +519,38 @@ class StockManager:
             print(f"处理股票数据时出错：{str(e)}")
             return []
 
-    @classmethod
-    def list_all_stocks(cls):
-        """同步包装异步处理函数"""
+    @staticmethod
+    def list_all_stocks():
+        """获取所有股票信息"""
+        conn = None
+        cursor = None
         try:
-            results = asyncio.run(cls.process_stocks())
-            if not results:
-                print("没有找到任何股票")
-                return []
-
-            print("\n股票分析结果：")
-            print("=" * 100)
+            conn = StockManager.get_db_connection()
+            cursor = conn.cursor(dictionary=True)
             
-            for stock in results:
-                print(f"\n{stock['code']} {stock['name']}")
-                print("-" * 50)
-                
-                # 计算已入手天数
-                days_held = (datetime.now() - stock['register_date']).days
-                
-                # 打印基本信息
-                print(f"现价：{stock.get('current_price', '获取失败')} "
-                      f"成本：{stock['actual_cost']:.2f} "
-                      f"数量：{stock['quantity']} "
-                      f"总成本：{stock['total_cost']:.2f} "
-                      f"入手时间：{stock['register_date'].strftime('%Y-%m-%d')} "
-                      f"已入手：{days_held}天")
-                
-                # 打印分析结果
-                if 'trading_analysis' in stock:
-                    analysis = stock['trading_analysis']
-                    if 'target_prices' in analysis and 'first_opportunities' in analysis:
-                        target_prices = analysis['target_prices']
-                        opportunities = analysis['first_opportunities']
-                        
-                        print("\n目标价位分析：")
-                        for rate in ['3%', '5%', '8%', '10%']:
-                            target_price = target_prices[rate]
-                            first_date = opportunities[rate]
-                            status = f"有机会（{first_date}）" if first_date else "暂无机会"
-                            print(f"  {rate}目标价（{target_price:.2f}）：{status}")
-                        
-                        # 打印止损情况
-                        stop_loss = analysis.get('first_stop_loss')
-                        stop_loss_price = analysis.get('stop_loss_price')
-                        if stop_loss_price:
-                            stop_loss_status = f"触发止损（{stop_loss}）" if stop_loss else "未触发止损"
-                            print(f"\n止损价（{stop_loss_price:.2f}）：{stop_loss_status}")
+            cursor.execute("""
+                SELECT s.code, s.cost, s.quantity, s.total_cost, s.register_date,
+                       i.name, i.current_price
+                FROM stocks s
+                JOIN stock_info i ON s.code = i.code
+                ORDER BY s.code
+            """)
             
-            print("\n" + "=" * 100)
-            return results
+            stocks = cursor.fetchall()
+            # 转换日期格式
+            for stock in stocks:
+                stock['register_date'] = stock['register_date']
+                
+            return stocks
             
         except Exception as e:
-            print(f"获取股票列表失败：{str(e)}")
+            print(f"获取股票列表失败：{e}")
             return []
+        finally:
+            if cursor:
+                cursor.close()
+            if conn:
+                conn.close()
     
     @classmethod
     def _is_valid_stock_code(cls, code):
@@ -471,19 +568,16 @@ class StockManager:
     def update_register_date(cls, code, new_date):
         """更新股票的入手日期"""
         try:
-            session = cls.Session()
+            conn = cls.get_db_connection()
+            cursor = conn.cursor()
             try:
-                result = session.execute(
-                    cls.stocks_table.update()
-                    .where(cls.stocks_table.c.code == code)
-                    .values(register_date=new_date)
-                )
-                session.commit()
-                if result.rowcount > 0:
-                    return True, "更新成功"
-                return False, "股票不存在"
+                cursor.execute("""
+                    UPDATE stocks SET register_date = %s WHERE code = %s
+                """, (new_date, code))
+                conn.commit()
+                return True, "更新成功"
             finally:
-                session.close()
+                cursor.close()
         except Exception as e:
             return False, f"更新失败：{str(e)}"
 
@@ -576,27 +670,29 @@ class StockManager:
             print("\n2. 测试串行处理性能...")
             start_time = time.time()
             stocks_serial = []
-            session = cls.Session()
+            conn = cls.get_db_connection()
             try:
-                query = cls.stocks_table.select()
-                db_stocks = session.execute(query).fetchall()
+                cursor = conn.cursor(dictionary=True)
+                cursor.execute("SELECT * FROM stocks")
+                db_stocks = cursor.fetchall()
                 
                 for stock in db_stocks:
                     stock_dict = {
-                        'code': stock.code,
-                        'name': stock.name,
-                        'notes': stock.notes,
-                        'register_date': stock.register_date,
-                        'entry_price': stock.entry_price,
-                        'actual_cost': stock.actual_cost,
-                        'quantity': stock.quantity,
-                        'total_cost': stock.total_cost
+                        'code': stock['code'],
+                        'name': stock['name'],
+                        'notes': stock['notes'],
+                        'register_date': stock['register_date'],
+                        'entry_price': stock['cost'],
+                        'actual_cost': stock['cost'],
+                        'quantity': stock['quantity'],
+                        'total_cost': stock['total_cost']
                     }
                     # 串行处理每个股票
-                    processed_stock = cls._process_single_stock(stock_dict, None)
+                    processed_stock = cls._async_process_single_stock(stock_dict, None)
                     stocks_serial.append(processed_stock)
             finally:
-                session.close()
+                cursor.close()
+                conn.close()
             
             serial_time = time.time() - start_time
             print(f"串行处理耗时: {serial_time:.2f}秒")
@@ -682,4 +778,76 @@ class StockManager:
                 print(f"  计算分析: {stats.get('计算分析', 0.00):.2f}秒")
                 total_time = (stats.get('获取历史数据', 0) + 
                             stats.get('计算分析', 0))
-                print(f"  总处理时间: {total_time:.2f}秒") 
+                print(f"  总处理时间: {total_time:.2f}秒")
+
+    @staticmethod
+    def delete_stock(code):
+        """删除股票并记录删除历史"""
+        try:
+            # 获取当前股票信息
+            conn = StockManager.get_db_connection()
+            cursor = conn.cursor(dictionary=True)
+            
+            # 获取股票信息
+            cursor.execute("""
+                SELECT s.*, i.name, i.current_price 
+                FROM stocks s
+                JOIN stock_info i ON s.code = i.code
+                WHERE s.code = %s
+            """, (code,))
+            stock = cursor.fetchone()
+            
+            if not stock:
+                return False, "股票不存在"
+            
+            # 记录删除历史
+            cursor.execute("""
+                INSERT INTO delete_history 
+                (code, name, price, cost, quantity, total_cost, delete_time)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            """, (
+                stock['code'],
+                stock['name'],
+                stock['current_price'],
+                stock['cost'],
+                stock['quantity'],
+                stock['total_cost']
+            ))
+            
+            # 删除股票
+            cursor.execute("DELETE FROM stocks WHERE code = %s", (code,))
+            conn.commit()
+            
+            return True, "删除成功"
+            
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+        finally:
+            cursor.close()
+            conn.close()
+
+    @staticmethod
+    def get_delete_history():
+        """获取删除历史记录"""
+        conn = None
+        cursor = None
+        try:
+            conn = StockManager.get_db_connection()
+            cursor = conn.cursor(dictionary=True)
+            
+            cursor.execute("""
+                SELECT * FROM delete_history
+                ORDER BY delete_time DESC
+            """)
+            
+            return cursor.fetchall()
+            
+        except Exception as e:
+            print(f"获取删除历史记录失败：{e}")
+            return []
+        finally:
+            if cursor:
+                cursor.close()
+            if conn:
+                conn.close() 

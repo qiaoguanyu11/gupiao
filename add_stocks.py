@@ -1,4 +1,5 @@
 from src.data.stock_manager import StockManager
+from datetime import datetime
 
 # 股票列表
 stocks = [
@@ -60,15 +61,45 @@ def main():
     success_count = 0
     fail_count = 0
     
-    for code, name, price in stocks:
-        # 添加股票，每只股票购买10000股
-        result, message = StockManager.add_stock(code, price, 10000, "批量添加")
-        if result:
-            success_count += 1
-            print(f"成功添加: {code} {name} 价格: {price}")
-        else:
-            fail_count += 1
-            print(f"添加失败: {code} {name} 原因: {message}")
+    # 设置统一的入手日期
+    entry_date = datetime(2025, 3, 23)
+    
+    # 获取数据库连接
+    conn = StockManager.get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        for code, name, price in stocks:
+            try:
+                # 计算实际成本（入手价格 * 100.04%）
+                actual_cost = price * 1.0004
+                # 计算总实际成本（实际成本 * 股票数量）
+                total_cost = actual_cost * 10000
+                
+                # 添加到stocks表
+                cursor.execute("""
+                    INSERT INTO stocks (code, cost, quantity, total_cost, register_date)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (code, actual_cost, 10000, total_cost, entry_date))
+                
+                # 添加到stock_info表
+                cursor.execute("""
+                    INSERT INTO stock_info (code, name, current_price, update_time)
+                    VALUES (%s, %s, %s, NOW())
+                """, (code, name, price))
+                
+                conn.commit()
+                success_count += 1
+                print(f"成功添加: {code} {name} 价格: {price}")
+                
+            except Exception as e:
+                conn.rollback()
+                fail_count += 1
+                print(f"添加失败: {code} {name} 原因: {str(e)}")
+                
+    finally:
+        cursor.close()
+        conn.close()
     
     print(f"\n添加完成！成功: {success_count} 失败: {fail_count}")
 
